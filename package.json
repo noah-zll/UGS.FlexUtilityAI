@@ -1,0 +1,25 @@
+{
+  "name": "com.ugs.flex-utility-ai",
+  "displayName": "UGS FlexUtilityAI",
+  "category": "UGS",
+  "description": "A configurable Utility AI decision-making framework for Unity with runtime mutable actions and considerations.",
+  "version": "0.1.0",
+  "unity": "2019.4",
+  "keywords": [
+    "AI",
+    "UtilityAI",
+    "DecisionMaking"
+  ],
+  "samples": [
+    {
+      "displayName": "XiuXian Demo",
+      "description": "Runtime-built Utility AI actions and blackboard feeding for a cultivation-sim scenario.",
+      "path": "Samples~/XiuXianDemo"
+    }
+  ],
+  "author": {
+    "name": "UGS Team",
+    "email": "contact@ugs.com",
+    "url": "https://www.ugs.com"
+  }
+}
