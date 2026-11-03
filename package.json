@@ -3,7 +3,7 @@
   "displayName": "UGS FlexUtilityAI",
   "category": "UGS",
   "description": "A configurable Utility AI decision-making framework for Unity with runtime mutable actions and considerations.",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "unity": "2019.4",
   "keywords": [
     "AI",
@@ -18,8 +18,8 @@
     }
   ],
   "author": {
-    "name": "UGS Team",
-    "email": "contact@ugs.com",
-    "url": "https://www.ugs.com"
+    "name": "Noah",
+    "email": "noah-zhou@qq.com",
+    "url": "https://github.com/noah-zll?tab=repositories"
   }
 }

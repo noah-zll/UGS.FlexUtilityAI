@@ -17,6 +17,27 @@ namespace UGS.FlexUtilityAI
         {
             return UtilityAIRuntimeModel.FromProfile(this);
         }
+
+        /// <summary>
+        /// 用运行时模型反向生成 Profile（编辑器生成资产、或运行时快照导出）。
+        /// <para>注意：生成的是内存对象，保存为资产需调用方自行 <c>AssetDatabase.CreateAsset</c>。</para>
+        /// </summary>
+        public static UtilityAIProfile CreateFromRuntimeModel(UtilityAIRuntimeModel model)
+        {
+            if (model == null) throw new ArgumentNullException(nameof(model));
+
+            var profile = CreateInstance<UtilityAIProfile>();
+            profile.name = nameof(UtilityAIProfile);
+            profile.aggregationMode = model.AggregationMode;
+            profile.actions = new List<UtilityAIActionDefinition>(model.Actions.Count);
+
+            for (int i = 0; i < model.Actions.Count; i++)
+            {
+                profile.actions.Add(UtilityAIActionDefinition.FromRuntime(model.Actions[i]));
+            }
+
+            return profile;
+        }
     }
 
     [Serializable]
@@ -35,6 +56,27 @@ namespace UGS.FlexUtilityAI
         public float CooldownSeconds => cooldownSeconds;
         public float MinSwitchIntervalSeconds => minSwitchIntervalSeconds;
         public IReadOnlyList<UtilityAIConsiderationDefinition> Considerations => considerations;
+
+        internal static UtilityAIActionDefinition FromRuntime(UtilityAIRuntimeAction action)
+        {
+            var definition = new UtilityAIActionDefinition
+            {
+                id = action.Id,
+                enabled = action.Enabled,
+                weight = action.Weight,
+                cooldownSeconds = action.CooldownSeconds,
+                minSwitchIntervalSeconds = action.MinSwitchIntervalSeconds,
+                considerations = new List<UtilityAIConsiderationDefinition>(action.Considerations.Count)
+            };
+
+            for (int i = 0; i < action.Considerations.Count; i++)
+            {
+                definition.considerations.Add(
+                    UtilityAIConsiderationDefinition.FromRuntime(action.Considerations[i]));
+            }
+
+            return definition;
+        }
     }
 
     [Serializable]
@@ -59,6 +101,22 @@ namespace UGS.FlexUtilityAI
         public bool Invert => invert;
         public bool UseFailThreshold => useFailThreshold;
         public float FailIfBelow => failIfBelow;
+
+        internal static UtilityAIConsiderationDefinition FromRuntime(UtilityAIRuntimeConsideration consideration)
+        {
+            return new UtilityAIConsiderationDefinition
+            {
+                id = consideration.Id,
+                blackboardFloatKey = consideration.BlackboardFloatKey,
+                inputMin = consideration.InputMin,
+                inputMax = consideration.InputMax,
+                response = consideration.Response,
+                weight = consideration.Weight,
+                invert = consideration.Invert,
+                useFailThreshold = consideration.UseFailThreshold,
+                failIfBelow = consideration.FailIfBelow
+            };
+        }
     }
 }
 

@@ -23,11 +23,9 @@ namespace UGS.FlexUtilityAI
         private readonly UtilityAIBlackboard _blackboard = new UtilityAIBlackboard();
         private readonly Dictionary<string, IUtilityAIActionExecutor> _executorsByActionId = new Dictionary<string, IUtilityAIActionExecutor>();
         private readonly List<UtilityAIDecisionSnapshot> _decisionHistory = new List<UtilityAIDecisionSnapshot>();
+        private readonly UtilityAIDecisionCore _core = new UtilityAIDecisionCore();
+
         private UtilityAIRuntimeModel _model;
-        private double _lastEvaluationTime = double.NegativeInfinity;
-        private string _currentActionId;
-        private float _currentScore;
-        private double _currentActionStartTime = double.NegativeInfinity;
         private IUtilityAIActionExecutor _currentExecutor;
 
         public event EventHandler<UtilityAIActionChangedEventArgs> ActionChanged;
@@ -36,8 +34,14 @@ namespace UGS.FlexUtilityAI
         public UtilityAIRuntimeModel Model => _model;
         public UtilityAIBlackboard Blackboard => _blackboard;
 
-        public string CurrentActionId => _currentActionId;
-        public float CurrentScore => _currentScore;
+        public string CurrentActionId => _core.CurrentActionId;
+        public float CurrentScore => _core.CurrentScore;
+
+        public bool EvaluateInUpdate => evaluateInUpdate;
+        public float EvaluationIntervalSeconds => evaluationIntervalSeconds;
+
+        /// <summary>最近一次 <see cref="ForceReevaluate"/> 传入的原因，便于调试。</summary>
+        public string LastReevaluateReason { get; private set; }
 
         public UtilityAIDecisionSnapshot LastDecisionSnapshot { get; private set; }
         public IReadOnlyList<UtilityAIDecisionSnapshot> DecisionHistory => _decisionHistory;
@@ -60,7 +64,7 @@ namespace UGS.FlexUtilityAI
 
             if (evaluateInUpdate)
             {
-                if (evaluationIntervalSeconds <= 0f || now - _lastEvaluationTime >= evaluationIntervalSeconds)
+                if (evaluationIntervalSeconds <= 0f || now - _core.LastEvaluationTime >= evaluationIntervalSeconds)
                 {
                     EvaluateOnce(now);
                 }
@@ -127,12 +131,10 @@ namespace UGS.FlexUtilityAI
             EnsureModel();
             if (_model == null) return false;
             bool removed = _model.RemoveAction(id);
-            if (removed && string.Equals(_currentActionId, id, StringComparison.Ordinal))
+            if (removed && string.Equals(CurrentActionId, id, StringComparison.Ordinal))
             {
                 TryExitCurrentExecutor();
-                _currentActionId = null;
-                _currentScore = 0f;
-                _currentActionStartTime = double.NegativeInfinity;
+                _core.ResetCurrentAction();
             }
 
             return removed;
@@ -155,7 +157,8 @@ namespace UGS.FlexUtilityAI
                 _executorsByActionId[id] = executor;
             }
 
-            if (!string.IsNullOrEmpty(_currentActionId) && _executorsByActionId.TryGetValue(_currentActionId, out IUtilityAIActionExecutor current))
+            if (!string.IsNullOrEmpty(CurrentActionId) &&
+                _executorsByActionId.TryGetValue(CurrentActionId, out IUtilityAIActionExecutor current))
             {
                 _currentExecutor = current;
             }
@@ -173,148 +176,164 @@ namespace UGS.FlexUtilityAI
         public void EvaluateOnce(double now)
         {
             EnsureModel();
-            _lastEvaluationTime = now;
 
-            if (_model == null || _model.Actions.Count == 0)
+            UtilityAIDecisionResult result = _core.Evaluate(_model, _blackboard, now, BuildSettings());
+            ApplyResult(result);
+        }
+
+        /// <summary>
+        /// 运行时替换 Profile。新增 API，用于按兵种/角色动态装配决策配置。
+        /// </summary>
+        public void SetProfile(UtilityAIProfile newProfile, bool rebuildModel = true)
+        {
+            profile = newProfile;
+
+            if (rebuildModel)
             {
-                UpdateDecisionSnapshot(now, null, "NoModelOrNoActions");
-                return;
+                RebuildModelFromProfile();
+                ResetDecisionState();
+            }
+            else
+            {
+                EnsureModel();
+            }
+        }
+
+        /// <summary>清空 Profile 与运行时模型。</summary>
+        public void ClearProfile()
+        {
+            profile = null;
+            _model = null;
+            ResetDecisionState();
+            LastDecisionSnapshot = null;
+        }
+
+        /// <summary>是否允许 Brain 自带 Update 自动评估。关闭后需外部调用 <see cref="EvaluateOnce()"/>。</summary>
+        public void SetEvaluationEnabled(bool enabled)
+        {
+            evaluateInUpdate = enabled;
+        }
+
+        /// <summary>设置自动评估间隔（秒）。&lt;=0 表示每帧。</summary>
+        public void SetEvaluationInterval(float seconds)
+        {
+            evaluationIntervalSeconds = Mathf.Max(0f, seconds);
+        }
+
+        /// <summary>设置行为切换稳定性参数。</summary>
+        public void SetSwitchTuning(float minTimeInState, float bias, float scoreDelta)
+        {
+            minTimeInStateSeconds = Mathf.Max(0f, minTimeInState);
+            switchBias = Mathf.Max(0f, bias);
+            switchScoreDelta = Mathf.Max(0f, scoreDelta);
+        }
+
+        public void SetCreateEmptyModelIfProfileMissing(bool enabled)
+        {
+            createEmptyModelIfProfileMissing = enabled;
+        }
+
+        public void SetDebugSnapshotEnabled(bool enabled)
+        {
+            enableDebugSnapshot = enabled;
+        }
+
+        public void SetDecisionRecording(bool enabled, int capacity = -1)
+        {
+            enableDecisionRecording = enabled;
+            if (capacity >= 0) decisionRecordingCapacity = capacity;
+        }
+
+        public void SetRecordBreakdown(bool enabled)
+        {
+            recordBreakdown = enabled;
+        }
+
+        public void SetLogOnActionSwitch(bool enabled)
+        {
+            logOnActionSwitch = enabled;
+        }
+
+        /// <summary>
+        /// 强制下一次评估重新决策：清空当前 Action 与驻留计时，并退出当前执行器。
+        /// <para>
+        /// 适用于 FSM 已自行结束当前行为（例如返回 Idle）但 Brain 仍停留在旧 Action 的场景。
+        /// </para>
+        /// </summary>
+        public void ForceReevaluate(string reason = null)
+        {
+            LastReevaluateReason = reason;
+            TryExitCurrentExecutor();
+            _core.ResetCurrentAction();
+
+            if (logOnActionSwitch)
+            {
+                Debug.Log($"{name} UtilityAI force reevaluate reason={reason ?? "(none)"}", this);
+            }
+        }
+
+        /// <summary>
+        /// 重新进入当前 Action：对执行器重新触发 OnExit/OnEnter，并再次抛出 ActionChanged。
+        /// <para>不会重新评估分数，适用于"行为已被外部状态打断，需要重新启动"的场景。</para>
+        /// </summary>
+        public void ReenterCurrentAction()
+        {
+            string currentId = CurrentActionId;
+            if (string.IsNullOrEmpty(currentId)) return;
+
+            TryExitCurrentExecutor();
+
+            if (_executorsByActionId.TryGetValue(currentId, out IUtilityAIActionExecutor executor))
+            {
+                _currentExecutor = executor;
+                _currentExecutor.OnEnter(this);
             }
 
-            string previousActionId = _currentActionId;
+            ActionChanged?.Invoke(this, new UtilityAIActionChangedEventArgs(
+                currentId, currentId, CurrentScore, Time.timeAsDouble));
+        }
 
-            UtilityAIRuntimeAction currentAction = string.IsNullOrEmpty(_currentActionId) ? null : _model.FindAction(_currentActionId);
-            float pinnedSeconds = 0f;
-            if (currentAction != null)
-            {
-                pinnedSeconds = Mathf.Max(0f, minTimeInStateSeconds);
-                pinnedSeconds = Mathf.Max(pinnedSeconds, currentAction.MinSwitchIntervalSeconds);
-            }
-            bool currentPinned = currentAction != null
-                                 && currentAction.Enabled
-                                 && pinnedSeconds > 0f
-                                 && now - _currentActionStartTime < pinnedSeconds;
-
-            float bestScore = -1f;
-            string bestActionId = null;
-            float currentScore = -1f;
-
-            bool wantSnapshot = enableDebugSnapshot || enableDecisionRecording;
+        private UtilityAIDecisionSettings BuildSettings()
+        {
+            bool captureSnapshot = enableDebugSnapshot || enableDecisionRecording;
             bool includeBreakdown = enableDebugSnapshot || recordBreakdown;
 
-            UtilityAIDecisionSnapshot snapshot = wantSnapshot ? new UtilityAIDecisionSnapshot() : null;
-            if (snapshot != null)
+            return new UtilityAIDecisionSettings(
+                minTimeInStateSeconds,
+                switchBias,
+                switchScoreDelta,
+                captureSnapshot,
+                includeBreakdown);
+        }
+
+        private void ApplyResult(UtilityAIDecisionResult result)
+        {
+            if (result == null) return;
+
+            LastDecisionSnapshot = result.Snapshot;
+
+            if (enableDecisionRecording && result.Snapshot != null)
             {
-                snapshot.Time = now;
-                snapshot.ModelVersion = _model.Version;
-                snapshot.CurrentActionId = _currentActionId;
+                AddDecisionHistory(result.Snapshot);
             }
 
-            for (int i = 0; i < _model.Actions.Count; i++)
+            if (!result.Changed) return;
+
+            TrySwitchExecutor(result.PreviousActionId, result.CurrentActionId);
+
+            if (logOnActionSwitch)
             {
-                UtilityAIRuntimeAction action = _model.Actions[i];
-                bool eligible = IsEligible(action, currentAction, now, out string ineligibleReason);
-
-                UtilityAIActionScoreSnapshot actionSnapshot = null;
-                float score = 0f;
-                if (eligible)
-                {
-                    actionSnapshot = UtilityAIScorer.EvaluateAction(action, _blackboard, _model.AggregationMode, includeBreakdown: includeBreakdown);
-                    score = actionSnapshot.Score;
-                }
-
-                if (snapshot != null)
-                {
-                    if (actionSnapshot == null) actionSnapshot = new UtilityAIActionScoreSnapshot { ActionId = action.Id, Score = score, Weight = action.Weight };
-                    actionSnapshot.Eligible = eligible;
-                    actionSnapshot.IneligibleReason = eligible ? null : ineligibleReason;
-                    snapshot.Actions.Add(actionSnapshot);
-                }
-
-                if (string.Equals(action.Id, _currentActionId, StringComparison.Ordinal))
-                {
-                    currentScore = score;
-                }
-
-                if (!eligible) continue;
-
-                if (score > bestScore)
-                {
-                    bestScore = score;
-                    bestActionId = action.Id;
-                }
+                Debug.Log($"{name} UtilityAI switch {result.PreviousActionId} -> {result.CurrentActionId} score={result.CurrentScore:F3} reason={result.SwitchReason}", this);
             }
 
-            if (currentPinned && currentAction != null)
-            {
-                _currentScore = currentScore < 0f ? 0f : currentScore;
-                UpdateDecisionSnapshot(now, bestActionId, "PinnedByMinSwitchInterval", snapshot, currentScore, bestScore);
-                return;
-            }
+            ActionChanged?.Invoke(this, new UtilityAIActionChangedEventArgs(
+                result.PreviousActionId, result.CurrentActionId, result.CurrentScore, result.Time));
+        }
 
-            bool canSwitch;
-            string switchReason;
-            if (currentAction == null || string.IsNullOrEmpty(_currentActionId))
-            {
-                canSwitch = true;
-                switchReason = "NoCurrentAction";
-            }
-            else if (!currentAction.Enabled)
-            {
-                canSwitch = true;
-                switchReason = "CurrentDisabled";
-            }
-            else
-            {
-                float baseCurrentScore = currentScore >= 0f ? currentScore : _currentScore;
-                float threshold = baseCurrentScore <= 0f ? 0f : baseCurrentScore * (1f + Mathf.Max(0f, switchBias));
-                threshold += Mathf.Max(0f, switchScoreDelta);
-                canSwitch = bestActionId != null && bestScore >= threshold && !string.Equals(bestActionId, _currentActionId, StringComparison.Ordinal);
-                switchReason = canSwitch ? "BestBeatsCurrentWithBias" : "KeepCurrent";
-            }
-
-            if (bestActionId == null)
-            {
-                bestActionId = _currentActionId;
-                bestScore = _currentScore;
-                switchReason = "NoEligibleAction";
-                canSwitch = false;
-            }
-
-            if (canSwitch)
-            {
-                _currentActionId = bestActionId;
-                _currentScore = bestScore;
-                _currentActionStartTime = now;
-
-                UtilityAIRuntimeAction selected = _model.FindAction(bestActionId);
-                if (selected != null) selected.LastSelectedTime = (float)now;
-            }
-            else
-            {
-                if (currentScore >= 0f) _currentScore = currentScore;
-                if (string.IsNullOrEmpty(_currentActionId))
-                {
-                    _currentActionId = bestActionId;
-                    _currentScore = bestScore;
-                    _currentActionStartTime = now;
-                    UtilityAIRuntimeAction selected = _model.FindAction(bestActionId);
-                    if (selected != null) selected.LastSelectedTime = (float)now;
-                    switchReason = "AdoptBest";
-                }
-            }
-
-            UpdateDecisionSnapshot(now, bestActionId, switchReason, snapshot, _currentScore, bestScore);
-
-            if (!string.Equals(previousActionId, _currentActionId, StringComparison.Ordinal))
-            {
-                TrySwitchExecutor(previousActionId, _currentActionId);
-                if (logOnActionSwitch)
-                {
-                    Debug.Log($"{name} UtilityAI switch {previousActionId} -> {_currentActionId} score={_currentScore:F3} reason={switchReason}", this);
-                }
-                ActionChanged?.Invoke(this, new UtilityAIActionChangedEventArgs(previousActionId, _currentActionId, _currentScore, now));
-            }
+        private void ResetDecisionState()
+        {
+            TryExitCurrentExecutor();
+            _core.ResetCurrentAction();
         }
 
         private void TickCurrentAction(float deltaTime)
@@ -332,7 +351,8 @@ namespace UGS.FlexUtilityAI
                 _currentExecutor.OnExit(this);
             }
 
-            if (!string.IsNullOrEmpty(currentActionId) && _executorsByActionId.TryGetValue(currentActionId, out IUtilityAIActionExecutor next))
+            if (!string.IsNullOrEmpty(currentActionId) &&
+                _executorsByActionId.TryGetValue(currentActionId, out IUtilityAIActionExecutor next))
             {
                 _currentExecutor = next;
                 _currentExecutor.OnEnter(this);
@@ -348,75 +368,6 @@ namespace UGS.FlexUtilityAI
             if (_currentExecutor == null) return;
             _currentExecutor.OnExit(this);
             _currentExecutor = null;
-        }
-
-        private bool IsEligible(UtilityAIRuntimeAction action, UtilityAIRuntimeAction currentAction, double now, out string ineligibleReason)
-        {
-            ineligibleReason = null;
-
-            if (action == null)
-            {
-                ineligibleReason = "NullAction";
-                return false;
-            }
-
-            if (string.IsNullOrEmpty(action.Id))
-            {
-                ineligibleReason = "EmptyActionId";
-                return false;
-            }
-
-            if (!action.Enabled)
-            {
-                ineligibleReason = "Disabled";
-                return false;
-            }
-
-            bool isCurrent = currentAction != null && string.Equals(currentAction.Id, action.Id, StringComparison.Ordinal);
-            if (!isCurrent)
-            {
-                if (action.CooldownSeconds > 0f && now - action.LastSelectedTime < action.CooldownSeconds)
-                {
-                    ineligibleReason = "Cooldown";
-                    return false;
-                }
-            }
-
-            return true;
-        }
-
-        private void UpdateDecisionSnapshot(double now, string bestActionId, string reason)
-        {
-            UpdateDecisionSnapshot(now, bestActionId, reason, null, _currentScore, _currentScore);
-        }
-
-        private void UpdateDecisionSnapshot(double now, string bestActionId, string reason, UtilityAIDecisionSnapshot snapshot, float currentScore, float bestScoreForSnapshot)
-        {
-            if (snapshot == null && (enableDebugSnapshot || enableDecisionRecording))
-            {
-                snapshot = new UtilityAIDecisionSnapshot();
-            }
-
-            if (snapshot != null)
-            {
-                snapshot.Time = now;
-                snapshot.CurrentActionId = _currentActionId;
-                snapshot.CurrentScore = currentScore;
-                snapshot.BestActionId = bestActionId;
-                snapshot.BestScore = bestScoreForSnapshot;
-                snapshot.SwitchReason = reason;
-                snapshot.ModelVersion = _model != null ? _model.Version : 0;
-                LastDecisionSnapshot = snapshot;
-
-                if (enableDecisionRecording)
-                {
-                    AddDecisionHistory(snapshot);
-                }
-            }
-            else
-            {
-                LastDecisionSnapshot = null;
-            }
         }
 
         private void AddDecisionHistory(UtilityAIDecisionSnapshot snapshot)

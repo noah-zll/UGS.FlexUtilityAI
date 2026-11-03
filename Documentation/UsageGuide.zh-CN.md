@@ -2,7 +2,7 @@
 
 本指南以“能在项目里跑起来 + 能调试 + 能扩展”为目标，覆盖从安装到复杂 Demo 调试、运行时动态变更、执行器接入与常见坑位。
 
-适用版本：0.1.0（以 [package.json](file:///e:/Projects/U3D/UGF/UGS.FlexUtilityAI/package.json) 为准）
+适用版本：0.2.0（以 [package.json](file:///e:/Projects/U3D/UGF/UGS.FlexUtilityAI/package.json) 为准）
 
 ---
 
@@ -313,6 +313,65 @@ brain.RefreshExecutors(); // 如果你也为它增加了 executor
 当你 `RemoveAction(currentActionId)` 时，Brain 会退出当前 executor，并把当前状态清空，下一次评估会选一个替代行为。
 
 见 [UtilityAIBrain.RemoveAction](file:///e:/Projects/U3D/UGF/UGS.FlexUtilityAI/Scripts/Runtime/Core/UtilityAIBrain.cs)。
+
+### 7.5 非 MonoBehaviour 决策核心与运行时配置（0.2.0）
+
+0.2.0 起，评估逻辑被抽到纯 C# 核心 [UtilityAIDecisionCore](file:///e:/Projects/U3D/UGF/UGS.FlexUtilityAI/Scripts/Runtime/Core/UtilityAIDecisionCore.cs)，`UtilityAIBrain` 只是它的一层 MonoBehaviour 包装。因此：
+
+- 无 GameObject 的数据层（例如大量未显示的 NPC）可以直接使用核心；
+- 实体层与数据层共享同一套评分/防抖逻辑，调试数据可直接对比；
+- `UtilityAIBrain` 的行为与 0.1.0 保持一致。
+
+数据层用法：
+
+```csharp
+var core = new UtilityAIDecisionCore();
+var blackboard = new UtilityAIBlackboard();
+var model = UtilityAIRuntimeModel.CreateEmpty(UtilityAIAggregationMode.Product);
+// ... 构建 Action / Consideration ...
+
+var settings = new UtilityAIDecisionSettings(
+    minTimeInStateSeconds: 1f,
+    switchBias: 0.1f,
+    switchScoreDelta: 0.02f,
+    captureSnapshot: false,
+    includeBreakdown: false);
+
+UtilityAIDecisionResult result = core.Evaluate(model, blackboard, now, settings);
+if (result.Changed) { /* 处理新行为 */ }
+```
+
+新增的 Brain 运行时 API：
+
+- `SetProfile(profile, rebuildModel = true)` / `ClearProfile()`
+- `SetEvaluationEnabled(bool)` / `SetEvaluationInterval(float)`
+- `SetSwitchTuning(minTimeInState, bias, scoreDelta)`
+- `SetDebugSnapshotEnabled` / `SetDecisionRecording` / `SetRecordBreakdown` / `SetLogOnActionSwitch`
+- `SetCreateEmptyModelIfProfileMissing(bool)`
+- `ForceReevaluate(reason)`：清空当前 Action 与驻留计时，下一次评估可立即重选
+- `ReenterCurrentAction()`：对当前 Action 重新触发执行器 Enter 与 `ActionChanged`
+
+`ForceReevaluate` / `ReenterCurrentAction` 用于解决"外部状态机已结束当前行为，但 Brain 仍停留在旧 Action"的场景。
+
+### 7.6 Profile 资产与线程约束（0.3.0）
+
+0.3.0 起支持把"代码构建的运行时模型"反序列化为 `UtilityAIProfile` 资产，之后在 Inspector 中调权重与曲线：
+
+```csharp
+UtilityAIRuntimeModel model = UtilityAIRuntimeModel.CreateEmpty(UtilityAIAggregationMode.Product);
+// ... 用代码构建 Action / Consideration ...
+UtilityAIProfile profile = UtilityAIProfile.CreateFromRuntimeModel(model);
+// 编辑器内：AssetDatabase.CreateAsset(profile, "Assets/XXX.asset");
+// 运行时：brain.SetProfile(profile); 或 profile.CreateRuntimeModel()
+```
+
+`CreateFromRuntimeModel` 只产生内存对象；保存为资产由调用方（编辑器工具）负责。
+
+后台线程约束：
+
+- `AnimationCurve.Evaluate` 属于 Unity API，不能在后台线程调用。
+- 数据层（离线 NPC）应把 `UtilityAIDecisionSettings.UseResponseCurves` 设为 `false`，评分退化为线性（`normalized`），其余评分/防抖逻辑不变。
+- 实体层（主线程）保持默认 `true`，曲线效果完整。
 
 ---
 

@@ -9,7 +9,8 @@ namespace UGS.FlexUtilityAI
             UtilityAIRuntimeAction action,
             UtilityAIBlackboard blackboard,
             UtilityAIAggregationMode aggregationMode,
-            bool includeBreakdown)
+            bool includeBreakdown,
+            bool useResponseCurves = true)
         {
             if (action == null) throw new ArgumentNullException(nameof(action));
             if (blackboard == null) throw new ArgumentNullException(nameof(blackboard));
@@ -25,11 +26,11 @@ namespace UGS.FlexUtilityAI
 
             if (aggregationMode == UtilityAIAggregationMode.WeightedAverage)
             {
-                score = EvaluateWeightedAverage(action, blackboard, snapshot);
+                score = EvaluateWeightedAverage(action, blackboard, snapshot, useResponseCurves);
             }
             else
             {
-                score = EvaluateProduct(action, blackboard, snapshot);
+                score = EvaluateProduct(action, blackboard, snapshot, useResponseCurves);
             }
 
             score *= Mathf.Max(0f, action.Weight);
@@ -42,13 +43,14 @@ namespace UGS.FlexUtilityAI
             return snapshot ?? new UtilityAIActionScoreSnapshot { ActionId = action.Id, Score = score, Weight = action.Weight };
         }
 
-        private static float EvaluateProduct(UtilityAIRuntimeAction action, UtilityAIBlackboard blackboard, UtilityAIActionScoreSnapshot snapshot)
+        private static float EvaluateProduct(UtilityAIRuntimeAction action, UtilityAIBlackboard blackboard,
+            UtilityAIActionScoreSnapshot snapshot, bool useResponseCurves)
         {
             float product = 1f;
             for (int i = 0; i < action.Considerations.Count; i++)
             {
                 UtilityAIRuntimeConsideration consideration = action.Considerations[i];
-                float weighted = EvaluateConsiderationWeighted(consideration, blackboard, snapshot);
+                float weighted = EvaluateConsiderationWeighted(consideration, blackboard, snapshot, useResponseCurves);
                 if (consideration.UseFailThreshold && weighted < consideration.FailIfBelow)
                 {
                     product = 0f;
@@ -61,14 +63,15 @@ namespace UGS.FlexUtilityAI
             return Mathf.Clamp01(product);
         }
 
-        private static float EvaluateWeightedAverage(UtilityAIRuntimeAction action, UtilityAIBlackboard blackboard, UtilityAIActionScoreSnapshot snapshot)
+        private static float EvaluateWeightedAverage(UtilityAIRuntimeAction action, UtilityAIBlackboard blackboard,
+            UtilityAIActionScoreSnapshot snapshot, bool useResponseCurves)
         {
             float sum = 0f;
             float weightSum = 0f;
             for (int i = 0; i < action.Considerations.Count; i++)
             {
                 UtilityAIRuntimeConsideration consideration = action.Considerations[i];
-                float weighted = EvaluateConsiderationWeighted(consideration, blackboard, snapshot);
+                float weighted = EvaluateConsiderationWeighted(consideration, blackboard, snapshot, useResponseCurves);
                 if (consideration.UseFailThreshold && weighted < consideration.FailIfBelow)
                 {
                     sum = 0f;
@@ -85,7 +88,8 @@ namespace UGS.FlexUtilityAI
             return Mathf.Clamp01(sum / weightSum);
         }
 
-        private static float EvaluateConsiderationWeighted(UtilityAIRuntimeConsideration consideration, UtilityAIBlackboard blackboard, UtilityAIActionScoreSnapshot actionSnapshot)
+        private static float EvaluateConsiderationWeighted(UtilityAIRuntimeConsideration consideration,
+            UtilityAIBlackboard blackboard, UtilityAIActionScoreSnapshot actionSnapshot, bool useResponseCurves)
         {
             float raw = blackboard.GetFloatOrDefault(consideration.BlackboardFloatKey, 0f);
 
@@ -100,7 +104,17 @@ namespace UGS.FlexUtilityAI
                 normalized = Mathf.Clamp01(normalized);
             }
 
-            float responseValue = consideration.Response != null ? consideration.Response.Evaluate(normalized) : normalized;
+            // 后台线程不能调用 AnimationCurve.Evaluate；关闭曲线时退化为线性（normalized）。
+            float responseValue;
+            if (!useResponseCurves || consideration.Response == null)
+            {
+                responseValue = normalized;
+            }
+            else
+            {
+                responseValue = consideration.Response.Evaluate(normalized);
+            }
+
             responseValue = Mathf.Clamp01(responseValue);
 
             if (consideration.Invert)
